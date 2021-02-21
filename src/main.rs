@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::cmp::{min, max};
 use vulkano::VulkanObject;
 use vulkano::image::sys::UnsafeImageView;
+use vulkano::framebuffer::{RenderPass, RenderPassAbstract};
 
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 900;
@@ -55,10 +56,11 @@ pub struct HelloTriangleApplication {
     graphics_queue: Arc<Queue>,
     present_queue: Arc<Queue>,
     swap_chain: Arc<SdlVulkanSwapchain>,
-    swap_chain_images: Vec<Arc<SdlVulkanImage>>,
     // By default, vulkano gives us reasonable image views into the swap chain images accessible
     // via the SwapchainImage. vulkano's support for more image view configuration is currently
     // a little lacking, so we just use those
+    swap_chain_images: Vec<Arc<SdlVulkanImage>>,
+    render_pass: Arc<dyn RenderPassAbstract>,
 
     // SDL2 stuff
     sdl_context: Sdl,
@@ -102,6 +104,7 @@ impl HelloTriangleApplication {
         let physical_device_index = Self::pick_physical_device(&instance, &surface);
         let (device, graphics_queue, present_queue) = Self::create_logical_device(&instance, &surface, physical_device_index);
         let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, device.clone(), physical_device_index, &window);
+        let render_pass = Self::create_render_pass(device.clone(), &swap_chain.format());
         Self::create_graphics_pipeline(device.clone());
 
         Self {
@@ -114,9 +117,30 @@ impl HelloTriangleApplication {
             present_queue,
             swap_chain,
             swap_chain_images,
+            render_pass,
             sdl_context,
             window
         }
+    }
+
+    fn create_render_pass(device: Arc<Device>, color_format: &impl FormatDesc) -> Arc<RenderPassAbstract + Send + Sync> {
+        Arc::new(vulkano::single_pass_renderpass! (
+            device.clone(),
+            attachments: {
+                // Define the "color" attachment
+                color_d: {
+                    load: Clear,
+                    store: Store,
+                    format: color_format.format(),
+                    samples: 1,
+                }
+            },
+            pass: {
+                // Use the defined "color" attachment
+                color: [color_d],
+                depth_stencil: {}
+            }
+        ).unwrap())
     }
 
     fn create_graphics_pipeline(device: Arc<Device>) {
@@ -339,12 +363,7 @@ impl HelloTriangleApplication {
             .expect("failed to retrieve supported extensions");
         println!("Supported extensions: {:?}", supported_extensions);
 
-        let application_info = ApplicationInfo {
-            application_name: Some("Vulkan Sandbox".into()),
-            application_version: Some(Version{major: 1, minor: 0, patch: 0}),
-            engine_name: Some("No Engine".into()),
-            engine_version: Some(Version{major: 1, minor: 0, patch: 0}),
-        };
+        let application_info =  vulkano::app_info_from_cargo_toml!();
 
         let _instance_extensions = window.vulkan_instance_extensions()
             .expect("failed to load vulkan extensions for sdl2 window");
