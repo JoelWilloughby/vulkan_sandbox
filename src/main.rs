@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::cmp::{min, max};
 use vulkano::VulkanObject;
 use vulkano::image::sys::UnsafeImageView;
-use vulkano::framebuffer::{RenderPass, RenderPassAbstract, Subpass};
+use vulkano::framebuffer::{RenderPass, RenderPassAbstract, Subpass, Framebuffer, FramebufferAbstract};
 use vulkano::pipeline::{GraphicsPipelineBuilder, GraphicsPipeline, GraphicsPipelineAbstract};
 use vulkano::pipeline::vertex::BufferlessDefinition;
 use vulkano::pipeline::input_assembly::PrimitiveTopology::TriangleList;
@@ -68,6 +68,7 @@ pub struct HelloTriangleApplication {
     swap_chain_images: Vec<Arc<SdlVulkanImage>>,
     render_pass: Arc<dyn RenderPassAbstract>,
     graphics_pipeline: Arc<dyn GraphicsPipelineAbstract>,
+    frame_buffers: Vec<Arc<dyn FramebufferAbstract>>,
 
     // SDL2 stuff
     sdl_context: Sdl,
@@ -113,6 +114,7 @@ impl HelloTriangleApplication {
         let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, device.clone(), physical_device_index, &window);
         let render_pass = Self::create_render_pass(device.clone(), &swap_chain.format());
         let graphics_pipeline = Self::create_graphics_pipeline(device.clone(), swap_chain.clone(), render_pass.clone());
+        let frame_buffers = Self::create_frame_buffers(&swap_chain_images, render_pass.clone());
 
         Self {
             instance,
@@ -126,9 +128,22 @@ impl HelloTriangleApplication {
             swap_chain_images,
             render_pass,
             graphics_pipeline,
+            frame_buffers,
             sdl_context,
             window
         }
+    }
+
+    fn create_frame_buffers(swap_chain_images: &Vec<Arc<SdlVulkanImage>>, render_pass: Arc<RenderPassAbstract>) -> Vec<Arc<FramebufferAbstract>>{
+        swap_chain_images.iter().map(|image| {
+            Arc::new(
+                Framebuffer::start(render_pass.clone())
+                    .add(image.clone())
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            ) as Arc<dyn FramebufferAbstract>
+        }).collect()
     }
 
     fn create_render_pass(device: Arc<Device>, color_format: &impl FormatDesc) -> Arc<RenderPassAbstract + Send + Sync> {
