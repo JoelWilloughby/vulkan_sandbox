@@ -23,7 +23,13 @@ use std::collections::HashMap;
 use std::cmp::{min, max};
 use vulkano::VulkanObject;
 use vulkano::image::sys::UnsafeImageView;
-use vulkano::framebuffer::{RenderPass, RenderPassAbstract};
+use vulkano::framebuffer::{RenderPass, RenderPassAbstract, Subpass};
+use vulkano::pipeline::{GraphicsPipelineBuilder, GraphicsPipeline, GraphicsPipelineAbstract};
+use vulkano::pipeline::vertex::BufferlessDefinition;
+use vulkano::pipeline::input_assembly::PrimitiveTopology::TriangleList;
+use vulkano::pipeline::input_assembly::PrimitiveTopology;
+use vulkano::pipeline::viewport::Viewport;
+use std::ops::Range;
 
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 900;
@@ -61,6 +67,7 @@ pub struct HelloTriangleApplication {
     // a little lacking, so we just use those
     swap_chain_images: Vec<Arc<SdlVulkanImage>>,
     render_pass: Arc<dyn RenderPassAbstract>,
+    graphics_pipeline: Arc<dyn GraphicsPipelineAbstract>,
 
     // SDL2 stuff
     sdl_context: Sdl,
@@ -105,7 +112,7 @@ impl HelloTriangleApplication {
         let (device, graphics_queue, present_queue) = Self::create_logical_device(&instance, &surface, physical_device_index);
         let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, device.clone(), physical_device_index, &window);
         let render_pass = Self::create_render_pass(device.clone(), &swap_chain.format());
-        Self::create_graphics_pipeline(device.clone());
+        let graphics_pipeline = Self::create_graphics_pipeline(device.clone(), swap_chain.clone(), render_pass.clone());
 
         Self {
             instance,
@@ -118,6 +125,7 @@ impl HelloTriangleApplication {
             swap_chain,
             swap_chain_images,
             render_pass,
+            graphics_pipeline,
             sdl_context,
             window
         }
@@ -143,7 +151,7 @@ impl HelloTriangleApplication {
         ).unwrap())
     }
 
-    fn create_graphics_pipeline(device: Arc<Device>) {
+    fn create_graphics_pipeline(device: Arc<Device>, swap_chain: Arc<SdlVulkanSwapchain>, render_pass: Arc<RenderPassAbstract>) -> Arc<GraphicsPipelineAbstract> {
         // We let the vulkano shader subsystem do the heavy lifting here.
         // These are compiled at build time into binary files and linked into
         // the final executable
@@ -160,8 +168,37 @@ impl HelloTriangleApplication {
             }
         }
 
-        vs::Shader::load(device.clone()).expect("failed to load vertex shader!");
-        fs::Shader::load(device.clone()).expect("failed to load fragment shader!");
+        let vs = vs::Shader::load(device.clone()).expect("failed to load vertex shader!");
+        let fs = fs::Shader::load(device.clone()).expect("failed to load fragment shader!");
+
+        let extent = swap_chain.dimensions();
+        let viewport = vec![
+            Viewport {
+                origin: [0.0, 0.0],
+                depth_range: 0.0..1.0,
+                dimensions: [extent[0] as f32, extent[1] as f32]
+            }
+        ];
+
+        Arc::new( GraphicsPipeline::start()
+            .vertex_input(BufferlessDefinition)
+            .primitive_topology(PrimitiveTopology::TriangleList)
+            .primitive_restart(false)
+            .viewports(viewport)
+            .depth_clamp(false)
+            .polygon_mode_fill()
+            .line_width(1.0)
+            .cull_mode_back()
+            .front_face_clockwise()
+            .sample_shading_disabled()
+            .blend_logic_op_disabled()
+//            .line_width_dynamic()
+//            .viewports_scissors_dynamic(0)
+            .vertex_shader(vs.main_entry_point(), ())
+            .fragment_shader(fs.main_entry_point(), ())
+            .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
+            .build(device.clone()).unwrap()
+        )
     }
 
     fn choose_format(capabilities: &Capabilities) -> (impl FormatDesc, ColorSpace) {
