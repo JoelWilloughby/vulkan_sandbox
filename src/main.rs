@@ -10,7 +10,7 @@ use vulkano::instance::{
 use vulkano::device::{Device, Features, Queue, DeviceExtensions};
 use vulkano::swapchain::{Surface, Capabilities, Swapchain, ColorSpace, CompositeAlpha, PresentMode, FullscreenExclusive};
 use vulkano::format::{Format, FormatDesc};
-use vulkano::image::{ImageUsage, SwapchainImage};
+use vulkano::image::{ImageUsage, SwapchainImage, ViewType};
 use vulkano::sync::SharingMode;
 
 use std::ffi::CString;
@@ -22,6 +22,7 @@ use std::rc::Rc;
 use std::collections::HashMap;
 use std::cmp::{min, max};
 use vulkano::VulkanObject;
+use vulkano::image::sys::UnsafeImageView;
 
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 900;
@@ -55,6 +56,9 @@ pub struct HelloTriangleApplication {
     present_queue: Arc<Queue>,
     swap_chain: Arc<SdlVulkanSwapchain>,
     swap_chain_images: Vec<Arc<SdlVulkanImage>>,
+    // By default, vulkano gives us reasonable image views into the swap chain images accessible
+    // via the SwapchainImage. vulkano's support for more image view configuration is currently
+    // a little lacking, so we just use those
 
     // SDL2 stuff
     sdl_context: Sdl,
@@ -98,6 +102,7 @@ impl HelloTriangleApplication {
         let physical_device_index = Self::pick_physical_device(&instance, &surface);
         let (device, graphics_queue, present_queue) = Self::create_logical_device(&instance, &surface, physical_device_index);
         let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, device.clone(), physical_device_index, &window);
+        Self::create_graphics_pipeline();
 
         Self {
             instance,
@@ -112,6 +117,10 @@ impl HelloTriangleApplication {
             sdl_context,
             window
         }
+    }
+
+    fn create_graphics_pipeline() {
+
     }
 
     fn choose_format(capabilities: &Capabilities) -> (impl FormatDesc, ColorSpace) {
