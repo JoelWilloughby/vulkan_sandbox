@@ -1,20 +1,27 @@
 use vulkano;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
+use sdl2::Sdl;
 
-use vulkano::instance::{ApplicationInfo, Version, InstanceExtensions, Instance, RawInstanceExtensions, LayerProperties, layers_list, PhysicalDevice, QueueFamily};
+use vulkano::instance::{
+    ApplicationInfo, Version, InstanceExtensions, Instance, RawInstanceExtensions, layers_list, PhysicalDevice,
+    debug::{DebugCallback, MessageType, MessageSeverity},
+};
+use vulkano::device::{Device, Features, Queue, DeviceExtensions};
+use vulkano::swapchain::{Surface, Capabilities, Swapchain, ColorSpace, CompositeAlpha, PresentMode, FullscreenExclusive};
+use vulkano::format::{Format, FormatDesc};
+use vulkano::image::{ImageUsage, SwapchainImage};
+use vulkano::sync::SharingMode;
+
 use std::ffi::CString;
 use std::sync::Arc;
 use sdl2::video::{Window, WindowContext};
 
 use std::convert::From;
-use vulkano::instance::debug::{DebugCallback, MessageType, MessageSeverity};
-use sdl2::Sdl;
-use vulkano::VulkanObject;
-use vulkano::device::{Device, RawDeviceExtensions, Features, Queue};
-use vulkano::swapchain::Surface;
 use std::rc::Rc;
 use std::collections::HashMap;
+use std::cmp::{min, max};
+use vulkano::VulkanObject;
 
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 900;
@@ -34,8 +41,10 @@ struct QueueFamilyIndices {
 }
 
 type SdlVulkanSurface = Surface<Rc<WindowContext>>;
+type SdlVulkanImage = SwapchainImage<Rc<WindowContext>>;
+type SdlVulkanSwapchain = Swapchain<Rc<WindowContext>>;
 
-struct HelloTriangleApplication {
+pub struct HelloTriangleApplication {
     instance: Arc<Instance>,
     debug_callback: Option<DebugCallback>,
     surface: Arc<SdlVulkanSurface>,
@@ -44,6 +53,8 @@ struct HelloTriangleApplication {
     device: Arc<Device>,
     graphics_queue: Arc<Queue>,
     present_queue: Arc<Queue>,
+    swap_chain: Arc<SdlVulkanSwapchain>,
+    swap_chain_images: Vec<Arc<SdlVulkanImage>>,
 
     // SDL2 stuff
     sdl_context: Sdl,
@@ -86,6 +97,7 @@ impl HelloTriangleApplication {
         let surface = Self::create_surface(instance.clone(), &window);
         let physical_device_index = Self::pick_physical_device(&instance, &surface);
         let (device, graphics_queue, present_queue) = Self::create_logical_device(&instance, &surface, physical_device_index);
+        let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, device.clone(), physical_device_index, &window);
 
         Self {
             instance,
@@ -95,14 +107,75 @@ impl HelloTriangleApplication {
             device,
             graphics_queue,
             present_queue,
+            swap_chain,
+            swap_chain_images,
             sdl_context,
             window
         }
     }
 
+    fn choose_format(capabilities: &Capabilities) -> (impl FormatDesc, ColorSpace) {
+        for format_desc in capabilities.supported_formats.iter() {
+            if let (Format::R8G8B8A8Srgb, ColorSpace::SrgbNonLinear) = format_desc {
+                return format_desc.clone();
+            }
+        }
+
+        // Just us the first one...
+        capabilities.supported_formats[0]
+    }
+
+    fn choose_present_mode(capabilities: &Capabilities) -> PresentMode {
+        if capabilities.present_modes.mailbox {
+            return PresentMode::Mailbox;
+        }
+
+        PresentMode::Fifo
+    }
+
+    fn choose_swap_extent(capabilities: &Capabilities, window: &Window) -> [u32; 2] {
+        capabilities.current_extent.unwrap_or_else(|| {
+            let (mut width, mut height) = window.drawable_size();
+            width = max(width, capabilities.max_image_extent[0]);
+            height = max(height, capabilities.max_image_extent[1]);
+            [width, height]
+        })
+    }
+
+    fn create_swap_chain(instance: &Arc<Instance>, surface: &Arc<SdlVulkanSurface>, device: Arc<Device>, physical_device_index: usize, window: &Window) -> (Arc<SdlVulkanSwapchain>, Vec<Arc<SdlVulkanImage>>){
+        let physical_device = PhysicalDevice::from_index(instance, physical_device_index).unwrap();
+        let capabilities = surface.capabilities(physical_device).unwrap();
+        let indices = QueueFamilyIndices::create(&physical_device, surface);
+
+        let num_images = min(capabilities.min_image_count + 1, capabilities.max_image_count.unwrap_or(u32::MAX));
+        let (format, color_space) = Self::choose_format(&capabilities);
+        let dimensions = Self::choose_swap_extent(&capabilities, window);
+        let indices = vec![indices.graphics.unwrap(), indices.presentable.unwrap()];
+        let present_mode = Self::choose_present_mode(&capabilities);
+
+        Swapchain::new(
+            device,
+            surface.clone(),
+            num_images,
+            format,
+            dimensions,
+            1u32,
+            ImageUsage::color_attachment(),
+            if indices[0] == indices[1] {SharingMode::Exclusive} else {SharingMode::Concurrent(indices)},
+            capabilities.current_transform,
+            CompositeAlpha::Opaque,
+            present_mode,
+            FullscreenExclusive::Default,
+            true,
+            color_space
+        ).expect("failed to create swap chain!")
+    }
+
     fn create_surface(instance: Arc<Instance>, window: &Window) -> Arc<SdlVulkanSurface> {
-        let surface_raw = window.vulkan_create_surface(instance.internal_object()).expect("failed to create surface!");
-        unsafe { Arc::new(Surface::from_raw_surface(instance, surface_raw, window.context())) }
+        unsafe {
+            let surface_raw = window.vulkan_create_surface(instance.internal_object()).expect("failed to create surface!");
+            Arc::new(Surface::from_raw_surface(instance, surface_raw, window.context()))
+        }
     }
 
     fn create_logical_device(instance: &Arc<Instance>, surface: &Arc<SdlVulkanSurface>, physical_device_index: usize) -> (Arc<Device>, Arc<Queue>, Arc<Queue>) {
@@ -113,13 +186,12 @@ impl HelloTriangleApplication {
         let mut queue_families = HashMap::new();
         queue_families.insert(indices.graphics.unwrap(), (physical_device.queue_family_by_id(indices.graphics.unwrap()).unwrap(), 1.0f32));
         queue_families.insert(indices.presentable.unwrap(), (physical_device.queue_family_by_id(indices.presentable.unwrap()).unwrap(), 1.0f32));
-        let extensions = RawDeviceExtensions::none();
+        let extensions = Self::required_device_extensions();
 
         let (device, queues_iter) = Device::new(
-            physical_device, &features, extensions, queue_families.values().cloned()
+            physical_device, &features, &extensions, queue_families.values().cloned()
         ).expect("failed to create logical device!");
 
-        // TODO how to get which queue is which ???
         let mut graphics_queue = None;
         let mut present_queue = None;
         for queue in queues_iter {
@@ -134,9 +206,36 @@ impl HelloTriangleApplication {
         (device, graphics_queue.unwrap(), present_queue.unwrap())
     }
 
+    fn required_device_extensions() -> DeviceExtensions {
+        let mut ext = DeviceExtensions::none();
+        ext.khr_swapchain = true;
+        ext
+    }
+
+    fn check_device_extensions_support(device: &PhysicalDevice) -> bool {
+        let supported_extensions = DeviceExtensions::supported_by_device(*device);
+        Self::required_device_extensions().difference(&supported_extensions) == DeviceExtensions::none()
+    }
+
     fn is_device_suitable(device: &PhysicalDevice, surface: &Arc<SdlVulkanSurface>) -> bool {
         let indices = QueueFamilyIndices::create(device, surface);
-        indices.is_complete()
+        if !indices.is_complete() {
+            return false;
+        }
+        if !Self::check_device_extensions_support(device) {
+            return false;
+        }
+
+        // Check capabilities of the swap chain
+        let capabilites = surface.capabilities(*device).expect("failed to get capabilities");
+        if capabilites.supported_formats.is_empty() {
+            return false;
+        }
+        if capabilites.present_modes.iter().next().is_none() {
+            return false;
+        }
+
+        true
     }
 
     fn pick_physical_device(instance: &Arc<Instance>, surface: &Arc<SdlVulkanSurface>) -> usize {
@@ -193,9 +292,9 @@ impl HelloTriangleApplication {
         );
 
         if ENABLE_VALIDATION_LAYERS {
-            let mut debug_ext = InstanceExtensions::none();
-            debug_ext.ext_debug_utils = true;
-            extensions = extensions.union(&RawInstanceExtensions::from(&debug_ext));
+            let mut ext = InstanceExtensions::none();
+            ext.ext_debug_utils = true;
+            extensions = extensions.union(&RawInstanceExtensions::from(&ext));
         }
 
         extensions
