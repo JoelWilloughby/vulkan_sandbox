@@ -102,7 +102,7 @@ impl HelloTriangleApplication {
         let physical_device_index = Self::pick_physical_device(&instance, &surface);
         let (device, graphics_queue, present_queue) = Self::create_logical_device(&instance, &surface, physical_device_index);
         let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, device.clone(), physical_device_index, &window);
-        Self::create_graphics_pipeline();
+        Self::create_graphics_pipeline(device.clone());
 
         Self {
             instance,
@@ -119,8 +119,25 @@ impl HelloTriangleApplication {
         }
     }
 
-    fn create_graphics_pipeline() {
+    fn create_graphics_pipeline(device: Arc<Device>) {
+        // We let the vulkano shader subsystem do the heavy lifting here.
+        // These are compiled at build time into binary files and linked into
+        // the final executable
+        mod vs {
+            vulkano_shaders::shader! {
+                ty: "vertex",
+                path: "./shaders/default.vert",
+            }
+        }
+        mod fs {
+            vulkano_shaders::shader! {
+                ty: "fragment",
+                path: "./shaders/default.frag",
+            }
+        }
 
+        vs::Shader::load(device.clone()).expect("failed to load vertex shader!");
+        fs::Shader::load(device.clone()).expect("failed to load fragment shader!");
     }
 
     fn choose_format(capabilities: &Capabilities) -> (impl FormatDesc, ColorSpace) {
