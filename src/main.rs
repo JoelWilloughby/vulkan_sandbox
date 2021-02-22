@@ -5,10 +5,10 @@ use sdl2::Sdl;
 
 use vulkano::instance::{InstanceExtensions, Instance, RawInstanceExtensions, layers_list, PhysicalDevice, debug::{DebugCallback, MessageType, MessageSeverity}};
 use vulkano::device::{Device, Features, Queue, DeviceExtensions};
-use vulkano::swapchain::{Surface, Capabilities, Swapchain, ColorSpace, CompositeAlpha, PresentMode, FullscreenExclusive};
+use vulkano::swapchain::{Surface, Capabilities, Swapchain, ColorSpace, CompositeAlpha, PresentMode, FullscreenExclusive, acquire_next_image};
 use vulkano::format::{Format, FormatDesc, ClearValue};
 use vulkano::image::{ImageUsage, SwapchainImage};
-use vulkano::sync::SharingMode;
+use vulkano::sync::{SharingMode, GpuFuture};
 
 use std::ffi::CString;
 use std::sync::Arc;
@@ -128,6 +128,7 @@ impl HelloTriangleApplication {
             sdl_context,
             window,
 
+            // Create these after build to avoid lifetime issues
             command_buffers: vec![],
         };
 
@@ -463,6 +464,18 @@ impl HelloTriangleApplication {
         (sdl_context, window)
     }
 
+    fn draw_frame(&mut self) {
+        let (idx, _sub_optimal, acquire_future) = acquire_next_image(self.swap_chain.clone(), None).unwrap();
+        let command_buffer = self.command_buffers[idx].clone();
+        let future = acquire_future
+            .then_execute(self.graphics_queue.clone(), command_buffer).unwrap()
+            .then_swapchain_present(self.present_queue.clone(), self.swap_chain.clone(), idx)
+            .then_signal_fence_and_flush()
+            .unwrap();
+
+        future.wait(None).unwrap();
+    }
+
     fn main_loop(&mut self) {
         let mut done = false;
         let mut event_pump = self.sdl_context.event_pump().unwrap();
@@ -475,6 +488,9 @@ impl HelloTriangleApplication {
                     _ => {}
                 }
             }
+
+            // Draw shit
+            self.draw_frame();
 
             ::std::thread::sleep(::std::time::Duration::new(0, 1_000_000_000u32 / 60));
         }
