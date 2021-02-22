@@ -3,33 +3,27 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::Sdl;
 
-use vulkano::instance::{
-    ApplicationInfo, Version, InstanceExtensions, Instance, RawInstanceExtensions, layers_list, PhysicalDevice,
-    debug::{DebugCallback, MessageType, MessageSeverity},
-};
+use vulkano::instance::{InstanceExtensions, Instance, RawInstanceExtensions, layers_list, PhysicalDevice, debug::{DebugCallback, MessageType, MessageSeverity}};
 use vulkano::device::{Device, Features, Queue, DeviceExtensions};
 use vulkano::swapchain::{Surface, Capabilities, Swapchain, ColorSpace, CompositeAlpha, PresentMode, FullscreenExclusive};
-use vulkano::format::{Format, FormatDesc};
-use vulkano::image::{ImageUsage, SwapchainImage, ViewType};
+use vulkano::format::{Format, FormatDesc, ClearValue};
+use vulkano::image::{ImageUsage, SwapchainImage};
 use vulkano::sync::SharingMode;
 
 use std::ffi::CString;
 use std::sync::Arc;
-use sdl2::video::{Window, WindowContext};
+use sdl2::video::{Window};
 
 use std::convert::From;
-use std::rc::Rc;
 use std::collections::HashMap;
 use std::cmp::{min, max};
 use vulkano::VulkanObject;
-use vulkano::image::sys::UnsafeImageView;
-use vulkano::framebuffer::{RenderPass, RenderPassAbstract, Subpass, Framebuffer, FramebufferAbstract};
-use vulkano::pipeline::{GraphicsPipelineBuilder, GraphicsPipeline, GraphicsPipelineAbstract};
-use vulkano::pipeline::vertex::BufferlessDefinition;
-use vulkano::pipeline::input_assembly::PrimitiveTopology::TriangleList;
-use vulkano::pipeline::input_assembly::PrimitiveTopology;
+use vulkano::framebuffer::{RenderPassAbstract, Subpass, Framebuffer, FramebufferAbstract};
+use vulkano::pipeline::{GraphicsPipeline};
+use vulkano::pipeline::vertex::{BufferlessDefinition, BufferlessVertices};
 use vulkano::pipeline::viewport::Viewport;
-use std::ops::Range;
+use vulkano::command_buffer::{AutoCommandBufferBuilder, SubpassContents, DynamicState, AutoCommandBuffer};
+use vulkano::descriptor::PipelineLayoutAbstract;
 
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 900;
@@ -48,9 +42,10 @@ struct QueueFamilyIndices {
     presentable: Option<u32>,
 }
 
-type SdlVulkanSurface = Surface<Rc<WindowContext>>;
-type SdlVulkanImage = SwapchainImage<Rc<WindowContext>>;
-type SdlVulkanSwapchain = Swapchain<Rc<WindowContext>>;
+type SdlVulkanSurface = Surface<()>;
+type SdlVulkanImage = SwapchainImage<()>;
+type SdlVulkanSwapchain = Swapchain<()>;
+type ConcreteGraphicsPipeline = GraphicsPipeline<BufferlessDefinition, Box<dyn PipelineLayoutAbstract + Send + Sync + 'static>, Arc<dyn RenderPassAbstract + Send + Sync + 'static>>;
 
 pub struct HelloTriangleApplication {
     instance: Arc<Instance>,
@@ -66,9 +61,10 @@ pub struct HelloTriangleApplication {
     // via the SwapchainImage. vulkano's support for more image view configuration is currently
     // a little lacking, so we just use those
     swap_chain_images: Vec<Arc<SdlVulkanImage>>,
-    render_pass: Arc<dyn RenderPassAbstract>,
-    graphics_pipeline: Arc<dyn GraphicsPipelineAbstract>,
-    frame_buffers: Vec<Arc<dyn FramebufferAbstract>>,
+    render_pass: Arc<dyn RenderPassAbstract + Send + Sync>,
+    graphics_pipeline: Arc<ConcreteGraphicsPipeline>,
+    frame_buffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
+    command_buffers: Vec<Arc<AutoCommandBuffer>>,
 
     // SDL2 stuff
     sdl_context: Sdl,
@@ -116,7 +112,7 @@ impl HelloTriangleApplication {
         let graphics_pipeline = Self::create_graphics_pipeline(device.clone(), swap_chain.clone(), render_pass.clone());
         let frame_buffers = Self::create_frame_buffers(&swap_chain_images, render_pass.clone());
 
-        Self {
+        let mut app = Self {
             instance,
             debug_callback,
             surface,
@@ -130,23 +126,46 @@ impl HelloTriangleApplication {
             graphics_pipeline,
             frame_buffers,
             sdl_context,
-            window
-        }
+            window,
+
+            command_buffers: vec![],
+        };
+
+        app.create_command_buffers();
+        app
     }
 
-    fn create_frame_buffers(swap_chain_images: &Vec<Arc<SdlVulkanImage>>, render_pass: Arc<RenderPassAbstract>) -> Vec<Arc<FramebufferAbstract>>{
+    fn create_command_buffers(&mut self) {
+        let queue_family = self.graphics_queue.family();
+        self.command_buffers = self.frame_buffers.iter().map(|buffer| {
+            let vertices = BufferlessVertices {
+                vertices: 3, instances: 1,
+            };
+
+            // Have to make a mut reference here to make Rust's borrow checker happy
+            let mut builder = AutoCommandBufferBuilder::primary_simultaneous_use(self.device.clone(), queue_family).unwrap();
+            builder
+                .begin_render_pass(buffer.clone(), SubpassContents::Inline, vec![ClearValue::Float([0.0, 0.0, 0.0, 1.0])]).unwrap()
+                .draw(self.graphics_pipeline.clone(), &DynamicState::none(), vertices, (), ()).unwrap()
+                .end_render_pass().unwrap();
+
+            Arc::new(
+                builder.build().unwrap()
+            )
+        }).collect();
+    }
+
+    fn create_frame_buffers(swap_chain_images: &Vec<Arc<SdlVulkanImage>>, render_pass: Arc<dyn RenderPassAbstract + Send + Sync>) -> Vec<Arc<dyn FramebufferAbstract + Send + Sync>>{
         swap_chain_images.iter().map(|image| {
             Arc::new(
                 Framebuffer::start(render_pass.clone())
-                    .add(image.clone())
-                    .unwrap()
-                    .build()
-                    .unwrap()
-            ) as Arc<dyn FramebufferAbstract>
+                    .add(image.clone()).unwrap()
+                    .build().unwrap()
+            ) as Arc<dyn FramebufferAbstract + Send + Sync>
         }).collect()
     }
 
-    fn create_render_pass(device: Arc<Device>, color_format: &impl FormatDesc) -> Arc<RenderPassAbstract + Send + Sync> {
+    fn create_render_pass(device: Arc<Device>, color_format: &impl FormatDesc) -> Arc<dyn RenderPassAbstract + Send + Sync> {
         Arc::new(vulkano::single_pass_renderpass! (
             device.clone(),
             attachments: {
@@ -166,7 +185,7 @@ impl HelloTriangleApplication {
         ).unwrap())
     }
 
-    fn create_graphics_pipeline(device: Arc<Device>, swap_chain: Arc<SdlVulkanSwapchain>, render_pass: Arc<RenderPassAbstract>) -> Arc<GraphicsPipelineAbstract> {
+    fn create_graphics_pipeline(device: Arc<Device>, swap_chain: Arc<SdlVulkanSwapchain>, render_pass: Arc<dyn RenderPassAbstract + Send + Sync>) -> Arc<ConcreteGraphicsPipeline> {
         // We let the vulkano shader subsystem do the heavy lifting here.
         // These are compiled at build time into binary files and linked into
         // the final executable
@@ -195,9 +214,9 @@ impl HelloTriangleApplication {
             }
         ];
 
-        Arc::new( GraphicsPipeline::start()
-            .vertex_input(BufferlessDefinition)
-            .primitive_topology(PrimitiveTopology::TriangleList)
+        Arc::new(GraphicsPipeline::start()
+            .vertex_input(BufferlessDefinition {})
+            .triangle_list()
             .primitive_restart(false)
             .viewports(viewport)
             .depth_clamp(false)
@@ -206,7 +225,7 @@ impl HelloTriangleApplication {
             .cull_mode_back()
             .front_face_clockwise()
             .sample_shading_disabled()
-            .blend_logic_op_disabled()
+            .blend_pass_through()
 //            .line_width_dynamic()
 //            .viewports_scissors_dynamic(0)
             .vertex_shader(vs.main_entry_point(), ())
@@ -276,7 +295,7 @@ impl HelloTriangleApplication {
     fn create_surface(instance: Arc<Instance>, window: &Window) -> Arc<SdlVulkanSurface> {
         unsafe {
             let surface_raw = window.vulkan_create_surface(instance.internal_object()).expect("failed to create surface!");
-            Arc::new(Surface::from_raw_surface(instance, surface_raw, window.context()))
+            Arc::new(Surface::from_raw_surface(instance, surface_raw, ()))
         }
     }
 
