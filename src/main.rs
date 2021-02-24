@@ -69,6 +69,8 @@ pub struct HelloTriangleApplication {
     // SDL2 stuff
     sdl_context: Sdl,
     window: Window,
+
+    needs_recreate: bool,
 }
 
 impl QueueFamilyIndices {
@@ -107,6 +109,8 @@ impl HelloTriangleApplication {
         let surface = Self::create_surface(instance.clone(), &window);
         let physical_device_index = Self::pick_physical_device(&instance, &surface);
         let (device, graphics_queue, present_queue) = Self::create_logical_device(&instance, &surface, physical_device_index);
+
+        // Needs to be done each time the swap chain needs to be re-created
         let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, device.clone(), physical_device_index, &window);
         let render_pass = Self::create_render_pass(device.clone(), &swap_chain.format());
         let graphics_pipeline = Self::create_graphics_pipeline(device.clone(), swap_chain.clone(), render_pass.clone());
@@ -130,10 +134,32 @@ impl HelloTriangleApplication {
 
             // Create these after build to avoid lifetime issues
             command_buffers: vec![],
+            needs_recreate: false,
         };
 
         app.create_command_buffers();
         app
+    }
+
+    fn recreate_swap_chain(&mut self) {
+        let physical_device = PhysicalDevice::from_index(&self.instance, self.physical_device_index).unwrap();
+        let capabilities = self.surface.capabilities(physical_device).unwrap();
+        let dimensions = Self::choose_swap_extent(&capabilities, &self.window);
+
+        let(swap_chain, swap_chain_images) = self.swap_chain.recreate_with_dimensions(dimensions).unwrap();
+        let render_pass = Self::create_render_pass(self.device.clone(), &swap_chain.format());
+        let graphics_pipeline = Self::create_graphics_pipeline(self.device.clone(), swap_chain.clone(), render_pass.clone());
+        let frame_buffers = Self::create_frame_buffers(&swap_chain_images, render_pass.clone());
+
+        self.swap_chain = swap_chain;
+        self.swap_chain_images = swap_chain_images;
+        self.render_pass = render_pass;
+        self.graphics_pipeline = graphics_pipeline;
+        self.frame_buffers = frame_buffers;
+
+        self.create_command_buffers();
+
+        self.needs_recreate = false;
     }
 
     fn create_command_buffers(&mut self) {
@@ -143,7 +169,6 @@ impl HelloTriangleApplication {
                 vertices: 3, instances: 1,
             };
 
-            // Have to make a mut reference here to make Rust's borrow checker happy
             let mut builder = AutoCommandBufferBuilder::primary_simultaneous_use(self.device.clone(), queue_family).unwrap();
             builder
                 .begin_render_pass(buffer.clone(), SubpassContents::Inline, vec![ClearValue::Float([0.0, 0.0, 0.0, 1.0])]).unwrap()
@@ -171,7 +196,7 @@ impl HelloTriangleApplication {
             device.clone(),
             attachments: {
                 // Define the "color" attachment
-                color_d: {
+                color: {
                     load: Clear,
                     store: Store,
                     format: color_format.format(),
@@ -180,7 +205,9 @@ impl HelloTriangleApplication {
             },
             pass: {
                 // Use the defined "color" attachment
-                color: [color_d],
+                // The color attachment here being index 0 directly corresponds to the
+                // layout(location = 0) out vec4 out_color in the frag shader.
+                color: [color],
                 depth_stencil: {}
             }
         ).unwrap())
@@ -227,10 +254,15 @@ impl HelloTriangleApplication {
             .front_face_clockwise()
             .sample_shading_disabled()
             .blend_pass_through()
+            // Can be used to not have to recreate the pipeline each time the window resizes
 //            .line_width_dynamic()
 //            .viewports_scissors_dynamic(0)
             .vertex_shader(vs.main_entry_point(), ())
             .fragment_shader(fs.main_entry_point(), ())
+            // One graphics pipeline is used for a single subpass of the render pass
+            // If you wanted to do more effects on top, then you would need another render pass
+            // and another graphics pipeline. Is this roughly equivalent to OpenGL's
+            // linked program?
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
             .build(device.clone()).unwrap()
         )
@@ -281,14 +313,14 @@ impl HelloTriangleApplication {
             num_images,
             format,
             dimensions,
-            1u32,
+            1u32, //layers
             ImageUsage::color_attachment(),
             if indices[0] == indices[1] {SharingMode::Exclusive} else {SharingMode::Concurrent(indices)},
             capabilities.current_transform,
             CompositeAlpha::Opaque,
             present_mode,
             FullscreenExclusive::Default,
-            true,
+            true, //clipped
             color_space
         ).expect("failed to create swap chain!")
     }
@@ -457,6 +489,7 @@ impl HelloTriangleApplication {
         let video_subsystem = sdl_context.video().unwrap();
 
         let window = video_subsystem.window("Vulkan Sandbox", WIDTH, HEIGHT)
+            .resizable()
             .vulkan()
             .build()
             .unwrap();
@@ -465,15 +498,28 @@ impl HelloTriangleApplication {
     }
 
     fn draw_frame(&mut self) {
-        let (idx, _sub_optimal, acquire_future) = acquire_next_image(self.swap_chain.clone(), None).unwrap();
+        let (idx, sub_optimal, acquire_future) = acquire_next_image(self.swap_chain.clone(), None).unwrap();
         let command_buffer = self.command_buffers[idx].clone();
         let future = acquire_future
-            .then_execute(self.graphics_queue.clone(), command_buffer).unwrap()
-            .then_swapchain_present(self.present_queue.clone(), self.swap_chain.clone(), idx)
-            .then_signal_fence_and_flush()
-            .unwrap();
+                .then_execute(self.graphics_queue.clone(), command_buffer).unwrap()
+                .then_swapchain_present(self.present_queue.clone(), self.swap_chain.clone(), idx)
+                .then_signal_fence_and_flush();
 
-        future.wait(None).unwrap();
+        match future {
+            Ok(future) => {
+                future.wait(None).unwrap();
+            },
+            Err(vulkano::sync::FlushError::OutOfDate) => {
+                self.needs_recreate = true;
+            },
+            Err(e) => {
+                println!("Failed to flush future {:?}", e);
+            }
+        }
+
+        if sub_optimal {
+            self.needs_recreate = true;
+        }
     }
 
     fn main_loop(&mut self) {
@@ -485,12 +531,24 @@ impl HelloTriangleApplication {
                     Event::Quit {..} | Event::KeyDown {keycode: Some(Keycode::Escape), .. } => {
                         done = true;
                     },
+                    Event::Window {win_event: event, ..} => {
+                        match event {
+                            sdl2::event::WindowEvent::Resized(..) | sdl2::event::WindowEvent::SizeChanged(..) => {
+                                self.needs_recreate = true;
+                            },
+                            _ => {}
+                        }
+                    }
                     _ => {}
                 }
             }
 
             // Draw shit
             self.draw_frame();
+
+            if self.needs_recreate {
+                self.recreate_swap_chain();
+            }
 
             ::std::thread::sleep(::std::time::Duration::new(0, 1_000_000_000u32 / 60));
         }
