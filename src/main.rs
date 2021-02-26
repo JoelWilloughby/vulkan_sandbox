@@ -2,6 +2,7 @@ use vulkano;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::Sdl;
+use glm;
 
 use vulkano::instance::{InstanceExtensions, Instance, RawInstanceExtensions, layers_list, PhysicalDevice, debug::{DebugCallback, MessageType, MessageSeverity}};
 use vulkano::device::{Device, Features, Queue, DeviceExtensions};
@@ -19,11 +20,13 @@ use std::collections::HashMap;
 use std::cmp::{min, max};
 use vulkano::VulkanObject;
 use vulkano::framebuffer::{RenderPassAbstract, Subpass, Framebuffer, FramebufferAbstract};
-use vulkano::pipeline::{GraphicsPipeline};
-use vulkano::pipeline::vertex::{BufferlessDefinition, BufferlessVertices};
+use vulkano::pipeline::{GraphicsPipeline, GraphicsPipelineAbstract};
+use vulkano::pipeline::vertex::{BufferlessDefinition, BufferlessVertices, VertexSource};
 use vulkano::pipeline::viewport::Viewport;
-use vulkano::command_buffer::{AutoCommandBufferBuilder, SubpassContents, DynamicState, AutoCommandBuffer};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, SubpassContents, DynamicState, AutoCommandBuffer, CommandBuffer};
 use vulkano::descriptor::PipelineLayoutAbstract;
+use glm::vec3;
+use vulkano::buffer::{CpuAccessibleBuffer, BufferUsage, DeviceLocalBuffer, BufferAccess};
 
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 900;
@@ -37,6 +40,16 @@ const ENABLE_VALIDATION_LAYERS: bool = true;
 #[cfg(not(debug_assertions))]
 const ENABLE_VALIDATION_LAYERS: bool = false;
 
+#[derive(Default, Debug, Clone)]
+#[repr(C)]
+struct Vertex {
+    in_position: [f32; 2],
+    in_color: [f32; 3],
+}
+
+// Implement the vertex trait
+vulkano::impl_vertex!(Vertex, in_position, in_color);
+
 struct QueueFamilyIndices {
     graphics: Option<u32>,
     presentable: Option<u32>,
@@ -45,7 +58,6 @@ struct QueueFamilyIndices {
 type SdlVulkanSurface = Surface<()>;
 type SdlVulkanImage = SwapchainImage<()>;
 type SdlVulkanSwapchain = Swapchain<()>;
-type ConcreteGraphicsPipeline = GraphicsPipeline<BufferlessDefinition, Box<dyn PipelineLayoutAbstract + Send + Sync + 'static>, Arc<dyn RenderPassAbstract + Send + Sync + 'static>>;
 
 pub struct HelloTriangleApplication {
     instance: Arc<Instance>,
@@ -62,9 +74,10 @@ pub struct HelloTriangleApplication {
     // a little lacking, so we just use those
     swap_chain_images: Vec<Arc<SdlVulkanImage>>,
     render_pass: Arc<dyn RenderPassAbstract + Send + Sync>,
-    graphics_pipeline: Arc<ConcreteGraphicsPipeline>,
+    graphics_pipeline: Arc<dyn GraphicsPipelineAbstract + Send + Sync>,
     frame_buffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
     command_buffers: Vec<Arc<AutoCommandBuffer>>,
+    vertex_buffers: Vec<Arc<dyn BufferAccess + Send + Sync>>,
 
     // SDL2 stuff
     sdl_context: Sdl,
@@ -101,6 +114,10 @@ impl QueueFamilyIndices {
     }
 }
 
+fn print_type_of<T>(_: &T) {
+    println!("{}", std::any::type_name::<T>())
+}
+
 impl HelloTriangleApplication {
     pub fn initialize() -> Self {
         let (sdl_context, window) = Self::init_window();
@@ -135,11 +152,14 @@ impl HelloTriangleApplication {
             // Create these after build to avoid lifetime issues
             command_buffers: vec![],
             needs_recreate: false,
+            vertex_buffers: vec![],
         };
 
+        app.create_vertex_buffer();
         app.create_command_buffers();
         app
     }
+
 
     fn recreate_swap_chain(&mut self) {
         let physical_device = PhysicalDevice::from_index(&self.instance, self.physical_device_index).unwrap();
@@ -162,17 +182,47 @@ impl HelloTriangleApplication {
         self.needs_recreate = false;
     }
 
+    fn create_vertex_buffer(&mut self) {
+        let vertices = [
+            Vertex{in_position: [0.0, -0.5], in_color: [1.0, 1.0, 1.0]},
+            Vertex{in_position: [0.5, 0.5], in_color: [0.0, 1.0, 0.0]},
+            Vertex{in_position: [-0.5, 0.5], in_color: [0.0, 0.0, 1.0]},
+        ];
+
+        // Create cpu buffer
+        let local_buffer = CpuAccessibleBuffer::from_iter(
+            self.device.clone(),
+            BufferUsage::transfer_source(),
+            false,
+            vertices.iter().cloned()
+        ).unwrap();
+
+        // Create device buffer
+        let device_buffer = DeviceLocalBuffer::<[Vertex]>::array(self.device.clone(), vertices.len(), BufferUsage::vertex_buffer_transfer_destination(), vec![self.graphics_queue.family()]).unwrap();
+
+        // Copy the contents of local to device
+        let mut builder = AutoCommandBufferBuilder::primary_one_time_submit(self.device.clone(), self.graphics_queue.family()).unwrap();
+        builder.copy_buffer(local_buffer.clone(), device_buffer.clone()).unwrap();
+        let command_buffer = builder.build().unwrap();
+        command_buffer.execute(self.graphics_queue.clone()).unwrap().flush().unwrap();
+
+        // Store off pointer to device buffer
+        self.vertex_buffers = vec![device_buffer];
+    }
+
     fn create_command_buffers(&mut self) {
         let queue_family = self.graphics_queue.family();
         self.command_buffers = self.frame_buffers.iter().map(|buffer| {
-            let vertices = BufferlessVertices {
-                vertices: 3, instances: 1,
-            };
-
             let mut builder = AutoCommandBufferBuilder::primary_simultaneous_use(self.device.clone(), queue_family).unwrap();
             builder
                 .begin_render_pass(buffer.clone(), SubpassContents::Inline, vec![ClearValue::Float([0.0, 0.0, 0.0, 1.0])]).unwrap()
-                .draw(self.graphics_pipeline.clone(), &DynamicState::none(), vertices, (), ()).unwrap()
+                .draw(
+                    self.graphics_pipeline.clone(),
+                    &DynamicState::none(),
+                    self.vertex_buffers.clone(),
+                    (),
+                    ()
+                ).unwrap()
                 .end_render_pass().unwrap();
 
             Arc::new(
@@ -213,7 +263,7 @@ impl HelloTriangleApplication {
         ).unwrap())
     }
 
-    fn create_graphics_pipeline(device: Arc<Device>, swap_chain: Arc<SdlVulkanSwapchain>, render_pass: Arc<dyn RenderPassAbstract + Send + Sync>) -> Arc<ConcreteGraphicsPipeline> {
+    fn create_graphics_pipeline(device: Arc<Device>, swap_chain: Arc<SdlVulkanSwapchain>, render_pass: Arc<dyn RenderPassAbstract + Send + Sync>) -> Arc<dyn GraphicsPipelineAbstract + Send + Sync> {
         // We let the vulkano shader subsystem do the heavy lifting here.
         // These are compiled at build time into binary files and linked into
         // the final executable
@@ -242,8 +292,8 @@ impl HelloTriangleApplication {
             }
         ];
 
-        Arc::new(GraphicsPipeline::start()
-            .vertex_input(BufferlessDefinition {})
+        let gp = Arc::new(GraphicsPipeline::start()
+            .vertex_input_single_buffer::<Vertex>()
             .triangle_list()
             .primitive_restart(false)
             .viewports(viewport)
@@ -265,7 +315,11 @@ impl HelloTriangleApplication {
             // linked program?
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
             .build(device.clone()).unwrap()
-        )
+        );
+
+//        print_type_of(&gp);
+
+        gp
     }
 
     fn choose_format(capabilities: &Capabilities) -> (impl FormatDesc, ColorSpace) {
